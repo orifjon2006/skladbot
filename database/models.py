@@ -67,7 +67,7 @@ class Payment(Base):
     
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     customer_id: Mapped[int] = mapped_column(ForeignKey('customers.id', ondelete='CASCADE'))
-    order_id: Mapped[int] = mapped_column(ForeignKey('orders.id', ondelete='SET NULL'), nullable=True)
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=True)
     amount: Mapped[float] = mapped_column(Float)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     
