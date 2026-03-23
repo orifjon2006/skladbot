@@ -1,146 +1,171 @@
 import logging
+
 from aiogram import Router, F
 from aiogram.types import Message, ReplyKeyboardRemove
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 
-from database.models import Customer, Payment
+from database.models import Customer, Order, Payment
 from handlers.admin import IsAdmin
 from services.notification_service import send_payment_notification
 
 router = Router()
 logger = logging.getLogger(__name__)
 
-# ==========================================
-# 1. TO'LOV FSM HOLATLARI
-# ==========================================
-class PaymentForm(StatesGroup):
-    customer_phone = State() # Mijozni izlash uchun
-    amount = State()         # To'lanayotgan summa
 
-# ==========================================
-# 2. GLOBAL BEKOR QILISH (Har qanday qadamda ishlaydi)
-# ==========================================
+class PaymentForm(StatesGroup):
+    receipt_code = State()
+    amount = State()
+
+
+def format_money(amount: float) -> str:
+    return f"{amount:,.0f} so'm"
+
+
+async def get_total_paid_for_order(session: AsyncSession, order_id: int) -> float:
+    result = await session.execute(
+        select(func.coalesce(func.sum(Payment.amount), 0)).where(Payment.order_id == order_id)
+    )
+    total_paid = result.scalar_one()
+    return float(total_paid or 0)
+
+
 @router.message(Command("cancel"))
 @router.message(F.text.casefold() == "bekor qilish")
 async def cancel_handler(message: Message, state: FSMContext):
     await state.clear()
     from handlers.admin import get_admin_menu
-    await message.answer(
-        "❌ Amaliyot bekor qilindi.", 
-        reply_markup=get_admin_menu()
-    )
+    await message.answer("❌ Amaliyot bekor qilindi.", reply_markup=get_admin_menu())
 
-# ==========================================
-# 3. TO'LOV BO'LIMIGA KIRISH
-# ==========================================
+
 @router.message(F.text == "💰 To'lov va Qarzlar", IsAdmin())
 async def payments_menu(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "💰 <b>Qarz va To'lovlar bo'limi</b>\n\n"
-        "To'lov qilayotgan mijozning telefon raqamini kiriting (masalan: 998901234567):\n\n"
-        "<i>(Bekor qilish uchun /cancel deb yozing)</i>",
+        "Mijoz bergan <b>harid kodini</b> kiriting:\n"
+        "<i>(Masalan: A1B2C3)</i>\n\n"
+        "<i>Bekor qilish uchun /cancel deb yozing</i>",
         reply_markup=ReplyKeyboardRemove()
     )
-    await state.set_state(PaymentForm.customer_phone)
+    await state.set_state(PaymentForm.receipt_code)
 
-# ==========================================
-# 4. MIJOZNI TOPISH VA QARZINI KO'RSATISH
-# ==========================================
-@router.message(PaymentForm.customer_phone)
-async def process_payment_customer(message: Message, state: FSMContext, session: AsyncSession):
-    phone = message.text.strip().replace("+", "")
-    
-    # Bazadan mijozni qidiramiz
-    result = await session.execute(select(Customer).where(Customer.phone == phone))
-    customer = result.scalar_one_or_none()
-    
-    if not customer:
+
+@router.message(PaymentForm.receipt_code)
+async def process_payment_receipt_code(message: Message, state: FSMContext, session: AsyncSession):
+    receipt_code = message.text.strip().upper()
+
+    result = await session.execute(
+        select(Order).where(Order.receipt_code == receipt_code)
+    )
+    order = result.scalar_one_or_none()
+
+    if not order:
         await message.answer(
-            "⚠️ Bunday raqamli mijoz topilmadi!\n"
-            "Iltimos, raqamni qayta tekshirib kiriting yoki /cancel ni bosing:"
+            "⚠️ Bunday harid kod topilmadi!\n"
+            "Kodni qayta tekshirib kiriting yoki /cancel ni bosing:"
         )
         return
-        
-    await state.update_data(customer_id=customer.id)
-    
-    # Balans holatini chiroyli formatda chiqarish
-    if customer.balance < 0:
-        balance_text = f"📉 <b>Joriy qarzdorlik:</b> {abs(customer.balance):,.0f} so'm"
-    elif customer.balance > 0:
-        balance_text = f"📈 <b>Haqdorlik (Oldindan to'lov):</b> {customer.balance:,.0f} so'm"
-    else:
-        balance_text = "⚖️ <b>Qarz yo'q (Balans: 0).</b>"
-        
+
+    customer = await session.get(Customer, order.customer_id)
+    if not customer:
+        await message.answer("❌ Ushbu kodga bog'langan mijoz topilmadi.")
+        return
+
+    total_paid = await get_total_paid_for_order(session, order.id)
+    remaining_debt = max(float(order.total_price) - total_paid, 0)
+    overpaid = max(total_paid - float(order.total_price), 0)
+
+    extra_text = ""
+    if overpaid > 0:
+        extra_text = f"\n📈 Ortiqcha to'langan: {format_money(overpaid)}"
+
+    await state.update_data(order_id=order.id, customer_id=customer.id, receipt_code=receipt_code)
+
     await message.answer(
+        f"🔑 <b>Harid kodi:</b> <code>{receipt_code}</code>\n"
         f"👤 <b>Mijoz:</b> {customer.name}\n"
         f"📞 <b>Telefon:</b> {customer.phone}\n"
-        f"{balance_text}\n\n"
-        f"💳 Mijoz qancha to'lov qilmoqda? (faqat raqam kiriting):"
+        f"💰 <b>Jami summa:</b> {format_money(float(order.total_price))}\n"
+        f"💵 <b>Jami to'langan:</b> {format_money(total_paid)}\n"
+        f"📉 <b>Qolgan qarz:</b> {format_money(remaining_debt)}"
+        f"{extra_text}\n\n"
+        f"💳 Endi qancha to'lov qilmoqda? (faqat raqam kiriting):"
     )
     await state.set_state(PaymentForm.amount)
 
-# ==========================================
-# 5. TO'LOVNI QABUL QILISH VA BAZAGA YOZISH
-# ==========================================
+
 @router.message(PaymentForm.amount)
 async def process_payment_amount(message: Message, state: FSMContext, session: AsyncSession):
-    # Kiritilgan summani tozalash (bo'sh joy va vergullarni olib tashlash)
     clean_val = message.text.replace(" ", "").replace(",", "").replace("'", "")
-    
+
     try:
         amount = float(clean_val)
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("⚠️ Iltimos, to'lov summasini noldan katta raqam shaklida kiriting (masalan: 50000):")
+        await message.answer(
+            "⚠️ Iltimos, to'lov summasini noldan katta raqam shaklida kiriting "
+            "(masalan: 50000):"
+        )
         return
-        
-    data = await state.get_data()
-    customer_id = data['customer_id']
-    
-    try:
-        # Mijozni bazadan yangitdan olamiz (oxirgi holatini bilish uchun)
-        customer = await session.get(Customer, customer_id)
-        if not customer:
-            raise Exception("Mijoz topilmadi")
 
-        # 1. Balansni yangilaymiz
-        customer.balance += amount
-        
-        # 2. To'lov tarixini yaratamiz
-        payment = Payment(customer_id=customer.id, amount=amount)
+    data = await state.get_data()
+    order_id = data["order_id"]
+    customer_id = data["customer_id"]
+    receipt_code = data["receipt_code"]
+
+    try:
+        order = await session.get(Order, order_id)
+        customer = await session.get(Customer, customer_id)
+
+        if not order:
+            raise Exception("Buyurtma topilmadi.")
+        if not customer:
+            raise Exception("Mijoz topilmadi.")
+
+        payment = Payment(
+            customer_id=customer.id,
+            order_id=order.id,
+            amount=amount
+        )
         session.add(payment)
-        
-        # 3. Bazaga saqlaymiz
+
+        current_balance = float(customer.balance or 0)
+        customer.balance = current_balance + amount
+
         await session.commit()
-        
-        # Yangi holat matni
-        if customer.balance < 0:
-            new_status = f"Qolgan qarz: {abs(customer.balance):,.0f} so'm"
-        else:
-            new_status = f"Ortiqcha to'lov: {customer.balance:,.0f} so'm"
+        await session.refresh(customer)
+
+        total_paid = await get_total_paid_for_order(session, order.id)
+        remaining_debt = max(float(order.total_price) - total_paid, 0)
+        overpaid = max(total_paid - float(order.total_price), 0)
+
+        extra_text = ""
+        if overpaid > 0:
+            extra_text = f"\n📈 Ortiqcha to'lov: {format_money(overpaid)}"
 
         from handlers.admin import get_admin_menu
         await message.answer(
             f"✅ <b>To'lov qabul qilindi!</b>\n\n"
+            f"🔑 Kod: <code>{receipt_code}</code>\n"
             f"👤 Mijoz: {customer.name}\n"
-            f"💵 Summa: {amount:,.0f} so'm\n"
-            f"💳 Yangi holat: {new_status}",
+            f"💵 Qabul qilingan summa: {format_money(amount)}\n"
+            f"💰 Jami to'langan: {format_money(total_paid)}\n"
+            f"📉 Qolgan qarz: {format_money(remaining_debt)}"
+            f"{extra_text}\n"
+            f"💳 Mijoz umumiy balansi: {format_money(customer.balance)}",
             reply_markup=get_admin_menu()
         )
-        
-        # 4. MIJOZGA AVTOMATIK BILDIRISHNOMA
+
         await send_payment_notification(message.bot, customer, amount)
-        
         await state.clear()
 
     except Exception as e:
         await session.rollback()
-        logger.error(f"To'lovni saqlashda xato: {e}")
-        await message.answer("❌ Xatolik yuz berdi. To'lov saqlanmadi.")
+        logger.exception("To'lovni saqlashda xato")
+        await message.answer(f"❌ Xatolik yuz berdi. To'lov saqlanmadi: {str(e)}")
         await state.clear()
