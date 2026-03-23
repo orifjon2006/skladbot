@@ -1,7 +1,10 @@
 import asyncio
 import logging
 import sys
+from handlers import customers_client, payments
 
+dp.include_router(customers_client.router)
+dp.include_router(payments.router)
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
