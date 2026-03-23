@@ -46,9 +46,7 @@ async def payments_menu(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "💰 <b>Qarz va To'lovlar bo'limi</b>\n\n"
-        "Mijoz bergan <b>harid kodini</b> kiriting:\n"
-        "<i>(Masalan: A1B2C3)</i>\n\n"
-        "<i>Bekor qilish uchun /cancel deb yozing</i>",
+        "Mijoz bergan <b>xarid kodini</b> kiriting:",
         reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(PaymentForm.receipt_code)
@@ -65,8 +63,8 @@ async def process_payment_receipt_code(message: Message, state: FSMContext, sess
 
     if not order:
         await message.answer(
-            "⚠️ Bunday harid kod topilmadi!\n"
-            "Kodni qayta tekshirib kiriting yoki /cancel ni bosing:"
+            "⚠️ Bunday xarid kod topilmadi!\n"
+            "Kodni qayta kiriting yoki /cancel ni bosing:"
         )
         return
 
@@ -76,25 +74,26 @@ async def process_payment_receipt_code(message: Message, state: FSMContext, sess
         return
 
     total_paid = await get_total_paid_for_order(session, order.id)
-    remaining_debt = max(float(order.total_price) - total_paid, 0)
-    overpaid = max(total_paid - float(order.total_price), 0)
+    total_price = float(order.total_price or 0)
+    remaining_debt = max(total_price - total_paid, 0)
+    overpaid = max(total_paid - total_price, 0)
 
-    extra_text = ""
-    if overpaid > 0:
-        extra_text = f"\n📈 Ortiqcha to'langan: {format_money(overpaid)}"
-
-    await state.update_data(order_id=order.id, customer_id=customer.id, receipt_code=receipt_code)
-
-    await message.answer(
-        f"🔑 <b>Harid kodi:</b> <code>{receipt_code}</code>\n"
+    text = (
+        f"🔑 <b>Xarid kodi:</b> <code>{receipt_code}</code>\n"
         f"👤 <b>Mijoz:</b> {customer.name}\n"
         f"📞 <b>Telefon:</b> {customer.phone}\n"
-        f"💰 <b>Jami summa:</b> {format_money(float(order.total_price))}\n"
+        f"💰 <b>Jami summa:</b> {format_money(total_price)}\n"
         f"💵 <b>Jami to'langan:</b> {format_money(total_paid)}\n"
         f"📉 <b>Qolgan qarz:</b> {format_money(remaining_debt)}"
-        f"{extra_text}\n\n"
-        f"💳 Endi qancha to'lov qilmoqda? (faqat raqam kiriting):"
     )
+
+    if overpaid > 0:
+        text += f"\n📈 <b>Ortiqcha to'lov:</b> {format_money(overpaid)}"
+
+    text += "\n\n💳 Endi qancha to'lov qilmoqda? (faqat raqam kiriting):"
+
+    await state.update_data(order_id=order.id, customer_id=customer.id, receipt_code=receipt_code)
+    await message.answer(text)
     await state.set_state(PaymentForm.amount)
 
 
@@ -141,25 +140,26 @@ async def process_payment_amount(message: Message, state: FSMContext, session: A
         await session.refresh(customer)
 
         total_paid = await get_total_paid_for_order(session, order.id)
-        remaining_debt = max(float(order.total_price) - total_paid, 0)
-        overpaid = max(total_paid - float(order.total_price), 0)
+        total_price = float(order.total_price or 0)
+        remaining_debt = max(total_price - total_paid, 0)
+        overpaid = max(total_paid - total_price, 0)
 
-        extra_text = ""
-        if overpaid > 0:
-            extra_text = f"\n📈 Ortiqcha to'lov: {format_money(overpaid)}"
-
-        from handlers.admin import get_admin_menu
-        await message.answer(
+        text = (
             f"✅ <b>To'lov qabul qilindi!</b>\n\n"
             f"🔑 Kod: <code>{receipt_code}</code>\n"
             f"👤 Mijoz: {customer.name}\n"
             f"💵 Qabul qilingan summa: {format_money(amount)}\n"
             f"💰 Jami to'langan: {format_money(total_paid)}\n"
             f"📉 Qolgan qarz: {format_money(remaining_debt)}"
-            f"{extra_text}\n"
-            f"💳 Mijoz umumiy balansi: {format_money(customer.balance)}",
-            reply_markup=get_admin_menu()
         )
+
+        if overpaid > 0:
+            text += f"\n📈 Ortiqcha to'lov: {format_money(overpaid)}"
+
+        text += f"\n💳 Mijoz umumiy balansi: {format_money(float(customer.balance or 0))}"
+
+        from handlers.admin import get_admin_menu
+        await message.answer(text, reply_markup=get_admin_menu())
 
         await send_payment_notification(message.bot, customer, amount)
         await state.clear()
